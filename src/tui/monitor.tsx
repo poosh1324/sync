@@ -4,10 +4,43 @@ import { render, Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
 import type { Session, Lock, Export, Event } from "../daemon/types";
 import { basename } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { join } from "node:path";
+import { abbreviatePath, formatUptime } from "../util/path";
+import { readSyncState } from "../util/state";
+
+function setTerminalTitle(title: string): void {
+  try {
+    writeFileSync("/dev/tty", `\x1b]0;${title}\x07`);
+  } catch {
+    /* /dev/tty not available */
+  }
+}
 
 const PORT = Number(process.env.SYNC_PORT ?? 7777);
 const BASE = `http://127.0.0.1:${PORT}`;
 const POLL_MS = 500;
+const CWD = process.cwd();
+
+function repoRoot(cwd: string): string {
+  try {
+    return execSync("git rev-parse --show-toplevel", { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return cwd;
+  }
+}
+
+function gitBranch(cwd: string): string {
+  try {
+    return execSync("git rev-parse --abbrev-ref HEAD", { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    return "?";
+  }
+}
+
+const REPO_ROOT = repoRoot(CWD);
+const SYNC_INITIALIZED = existsSync(join(REPO_ROOT, ".claude", "settings.json"));
 
 type State = {
   sessions: Session[];
@@ -16,11 +49,31 @@ type State = {
   events: Event[];
 };
 
+type Health = {
+  status?: string;
+  ok?: boolean;
+  ts?: number;
+  started_at?: number;
+  version?: string;
+};
+
 async function fetchState(): Promise<State | null> {
   try {
-    const res = await fetch(`${BASE}/state/full`, { signal: AbortSignal.timeout(800) });
+    const res = await fetch(`${BASE}/state/full?cwd=${encodeURIComponent(REPO_ROOT)}`, {
+      signal: AbortSignal.timeout(800),
+    });
     if (!res.ok) return null;
     return (await res.json()) as State;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchHealth(): Promise<Health | null> {
+  try {
+    const res = await fetch(`${BASE}/health`, { signal: AbortSignal.timeout(500) });
+    if (!res.ok) return null;
+    return (await res.json()) as Health;
   } catch {
     return null;
   }
@@ -46,7 +99,7 @@ function statusGlyph(s: Session["status"]): string {
     case "thinking":
       return "🧠";
     case "waiting":
-      return "⏳";
+      return "⏳ queued";
     default:
       return "·";
   }
@@ -58,22 +111,27 @@ function fmtTime(ts: number): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function eventLabel(e: Event): string {
+function eventLabel(e: Event, idToLabel: Map<string, string>): string {
+  const lbl = (id: string) => idToLabel.get(id) ?? id.slice(0, 6);
   switch (e.type) {
     case "session_joined":
-      return `${e.session.id} joined (${e.session.branch})`;
+      return `${lbl(e.session.id)} joined (${e.session.branch})`;
     case "session_left":
-      return `${e.session_id} left`;
+      return `${lbl(e.session_id)} left`;
     case "intent_announced":
-      return `${e.session_id} announced: ${e.intent.summary || "(empty)"}`;
+      return `${lbl(e.session_id)} announced: ${e.intent.summary || "(empty)"}`;
     case "lock_acquired":
-      return `${e.lock.session_id} acquired ${basename(e.lock.path)}`;
+      return `${lbl(e.lock.session_id)} acquired ${basename(e.lock.path)}`;
     case "lock_released":
-      return `${e.session_id} released ${basename(e.path)}`;
+      return `${lbl(e.session_id)} released ${basename(e.path)}`;
     case "lock_denied":
-      return `${e.requester} BLOCKED on ${basename(e.path)} (held by ${e.held_by})`;
+      return `${lbl(e.requester)} BLOCKED on ${basename(e.path)} (held by ${lbl(e.held_by)})`;
     case "export_created":
-      return `${e.session_id} exported [${e.symbols.join(", ")}] from ${basename(e.file)}`;
+      return `${lbl(e.session_id)} exported [${e.symbols.join(", ")}] from ${basename(e.file)}`;
+    case "session_queued":
+      return `${lbl(e.session_id)} ⏳ QUEUED — waiting on ${lbl(e.held_by)}`;
+    case "session_resumed":
+      return `${lbl(e.session_id)} ▶ RESUMED after ${(e.waited_ms / 1000).toFixed(1)}s wait`;
   }
 }
 
@@ -81,6 +139,10 @@ function eventColor(e: Event): string {
   switch (e.type) {
     case "lock_denied":
       return "red";
+    case "session_queued":
+      return "yellow";
+    case "session_resumed":
+      return "greenBright";
     case "lock_acquired":
       return "green";
     case "export_created":
@@ -99,6 +161,7 @@ function eventColor(e: Event): string {
 function SessionCard({ session, locks }: { session: Session; locks: Lock[] }) {
   const intent = session.current_intent;
   const heldByMe = locks.filter((l) => l.session_id === session.id);
+  const display = session.label ?? session.id.slice(0, 6);
   return (
     <Box
       borderStyle="round"
@@ -109,8 +172,9 @@ function SessionCard({ session, locks }: { session: Session; locks: Lock[] }) {
     >
       <Box>
         <Text bold color={statusColor(session.status)}>
-          [{session.id}]
+          [{display}]
         </Text>
+        <Text color="gray"> ({session.id.slice(0, 6)})</Text>
         <Text> </Text>
         <Text>{intent?.summary || "(no intent yet)"}</Text>
         <Text> </Text>
@@ -134,9 +198,62 @@ function SessionCard({ session, locks }: { session: Session; locks: Lock[] }) {
   );
 }
 
+function Header({
+  state,
+  health,
+  syncEnabled,
+}: {
+  state: State | null;
+  health: Health | null;
+  syncEnabled: boolean;
+}) {
+  if (!SYNC_INITIALIZED) {
+    return (
+      <Box borderStyle="double" borderColor="red" paddingX={1} flexDirection="column">
+        <Text color="red" bold>🔴 Not initialized in this directory</Text>
+        <Text color="gray">Run `syncc init` to enable Sync for this project</Text>
+      </Box>
+    );
+  }
+  const branch = gitBranch(REPO_ROOT);
+  const sessionCount = state?.sessions?.length ?? 0;
+  const queuedCount = state?.sessions?.filter((s) => s.status === "waiting").length ?? 0;
+  const word = sessionCount === 1 ? "session" : "sessions";
+  const statusGlyph = syncEnabled ? "🟢 enabled" : "🟡 paused";
+  const statusColor = syncEnabled ? "green" : "yellow";
+  const uptime = health?.started_at ? formatUptime(Date.now() - health.started_at) : "—";
+  return (
+    <Box borderStyle="double" borderColor="cyan" paddingX={1} flexDirection="column">
+      <Box>
+        <Text>📂 </Text>
+        <Text bold color="cyan">{abbreviatePath(REPO_ROOT)}</Text>
+        <Text color="gray">  ·  branch: </Text>
+        <Text>{branch}</Text>
+        <Text color="gray">  ·  </Text>
+        <Text>{sessionCount} {word}</Text>
+        {queuedCount > 0 ? (
+          <>
+            <Text color="gray">  ·  </Text>
+            <Text color="yellow">⏳ {queuedCount} queued</Text>
+          </>
+        ) : null}
+      </Box>
+      <Box>
+        <Text color={statusColor}>{statusGlyph}</Text>
+        <Text color="gray">  ·  daemon: 127.0.0.1:{PORT}</Text>
+        <Text color="gray">  ·  uptime: </Text>
+        <Text>{uptime}</Text>
+        <Text color="gray">  ·  q to quit</Text>
+      </Box>
+    </Box>
+  );
+}
+
 function App() {
   const { exit } = useApp();
   const [state, setState] = useState<State | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [syncEnabled, setSyncEnabled] = useState<boolean>(true);
   const [tick, setTick] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -149,14 +266,26 @@ function App() {
   useEffect(() => {
     let mounted = true;
     let timer: NodeJS.Timeout;
+    setTerminalTitle(`sync mon · ${basename(REPO_ROOT)}`);
     const loop = async () => {
-      const s = await fetchState();
+      const [s, h] = await Promise.all([fetchState(), fetchHealth()]);
       if (!mounted) return;
       if (s) {
         setState(s);
         setError(null);
-      } else {
+        const labels = s.sessions.map((x) => x.label ?? x.id.slice(0, 4)).join(",");
+        const queued = s.sessions.filter((x) => x.status === "waiting").length;
+        const queuedTag = queued > 0 ? ` · ⏳${queued}` : "";
+        const peerTag = labels ? ` [${labels}]` : "";
+        setTerminalTitle(`sync mon · ${basename(REPO_ROOT)}${peerTag}${queuedTag}`);
+      } else if (SYNC_INITIALIZED) {
         setError(`daemon not responding at ${BASE}`);
+      }
+      setHealth(h);
+      try {
+        setSyncEnabled(readSyncState().enabled);
+      } catch {
+        /* ignore */
       }
       setTick((t) => t + 1);
       timer = setTimeout(loop, POLL_MS);
@@ -168,36 +297,36 @@ function App() {
     };
   }, []);
 
-  if (!state) {
+  if (!SYNC_INITIALIZED) {
     return (
-      <Box>
-        <Text color="cyan">
-          <Spinner type="dots" />
-        </Text>
-        <Text> connecting to sync daemon at {BASE}…</Text>
-        {error ? <Text color="red"> {error}</Text> : null}
+      <Box flexDirection="column">
+        <Header state={null} health={null} syncEnabled={syncEnabled} />
       </Box>
     );
   }
 
-  const branchSet = [...new Set(state.sessions.map((s) => s.branch))];
-  const cwdSet = [...new Set(state.sessions.map((s) => s.cwd))];
+  if (!state) {
+    return (
+      <Box flexDirection="column">
+        <Header state={null} health={health} syncEnabled={syncEnabled} />
+        <Box marginTop={1}>
+          <Text color="cyan">
+            <Spinner type="dots" />
+          </Text>
+          <Text> connecting to sync daemon at {BASE}…</Text>
+          {error ? <Text color="red"> {error}</Text> : null}
+        </Box>
+      </Box>
+    );
+  }
 
   return (
     <Box flexDirection="column">
-      <Box borderStyle="double" borderColor="cyan" paddingX={1} flexDirection="column">
-        <Box>
-          <Text bold color="cyan">Sync Mesh </Text>
-          <Text>· {state.sessions.length} sessions active</Text>
-          <Text color="gray">  ·  branch{branchSet.length > 1 ? "es" : ""}: {branchSet.join(", ") || "—"}</Text>
-          <Text color="gray">  ·  {cwdSet.length} repo{cwdSet.length === 1 ? "" : "s"}</Text>
-          <Text color="gray">  ·  q to quit</Text>
-        </Box>
-      </Box>
+      <Header state={state} health={health} syncEnabled={syncEnabled} />
 
       {state.sessions.length === 0 ? (
         <Box paddingX={1} marginTop={1}>
-          <Text color="gray">No sessions registered yet. Start `claude` in a project where you've run `sync init`.</Text>
+          <Text color="gray">No sessions registered yet. Start `claude` in this repo to join the mesh.</Text>
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
@@ -212,12 +341,17 @@ function App() {
         {state.events.length === 0 ? (
           <Text color="gray">  (waiting for activity…)</Text>
         ) : (
-          state.events.slice(-12).map((e, i) => (
-            <Box key={`${e.ts}-${i}-${e.type}`}>
-              <Text color="gray">{fmtTime(e.ts)}  </Text>
-              <Text color={eventColor(e)}>{eventLabel(e)}</Text>
-            </Box>
-          ))
+          (() => {
+            const idToLabel = new Map<string, string>(
+              state.sessions.map((s) => [s.id, s.label ?? s.id.slice(0, 6)])
+            );
+            return state.events.slice(-12).map((e, i) => (
+              <Box key={`${e.ts}-${i}-${e.type}`}>
+                <Text color="gray">{fmtTime(e.ts)}  </Text>
+                <Text color={eventColor(e)}>{eventLabel(e, idToLabel)}</Text>
+              </Box>
+            ));
+          })()
         )}
       </Box>
 

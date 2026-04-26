@@ -1,10 +1,19 @@
 #!/usr/bin/env bun
 import { Command } from "commander";
 import { join, resolve, dirname } from "node:path";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  appendFileSync,
+  mkdirSync,
+  copyFileSync,
+  readdirSync,
+} from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import {
+  DAEMON_BASE,
   daemonHealth,
   ensureDaemon,
   getJson,
@@ -13,14 +22,65 @@ import {
   SYNC_PORT,
 } from "../hooks/util";
 import type { Session, Lock, Export, Event } from "../daemon/types";
+import { readSyncState, writeSyncState } from "../util/state";
 
 const HOOKS_DIR = join(SYNC_HOME, "hooks");
 const DAEMON_ENTRY = join(HOOKS_DIR, "daemon-entry.ts");
 
 function findSourceRoot(): string {
-  // Resolve directory containing src/hooks/*.ts so we can copy hook scripts
-  // When run via `bun run src/cli/index.ts`, __dirname-equivalent is import.meta.dir
+  // Walk up from import.meta.dir looking for the dir that contains src/hooks.
+  // Works for both `bun run src/cli/index.ts` (dir = .../src/cli/) and
+  // bundled `dist/index.js` (dir = .../dist/).
+  let dir = import.meta.dir;
+  for (let i = 0; i < 6; i++) {
+    if (existsSync(join(dir, "src", "hooks", "session-start.ts"))) return dir;
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  // Fallback: assume two levels up (legacy)
   return resolve(import.meta.dir, "..", "..");
+}
+
+// Slash commands available in every claude session: /sync-me, /sync-status,
+// /sync-peers. Installed user-globally so they work from any project once
+// the user has run `syncc init` once.
+const SYNC_COMMAND_FILES = ["sync-me.md", "sync-status.md", "sync-peers.md"];
+
+function installSlashCommands(sourceRoot: string): { installed: number; skipped: number } {
+  const userCommandsDir = join(homedir(), ".claude", "commands");
+  mkdirSync(userCommandsDir, { recursive: true });
+  const srcCommandsDir = join(sourceRoot, "src", "commands");
+  let installed = 0;
+  let skipped = 0;
+  for (const f of SYNC_COMMAND_FILES) {
+    const src = join(srcCommandsDir, f);
+    const dst = join(userCommandsDir, f);
+    if (!existsSync(src)) {
+      skipped++;
+      continue;
+    }
+    copyFileSync(src, dst);
+    installed++;
+  }
+  return { installed, skipped };
+}
+
+function uninstallSlashCommands(): number {
+  const userCommandsDir = join(homedir(), ".claude", "commands");
+  let removed = 0;
+  for (const f of SYNC_COMMAND_FILES) {
+    const p = join(userCommandsDir, f);
+    if (existsSync(p)) {
+      try {
+        require("node:fs").unlinkSync(p);
+        removed++;
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  return removed;
 }
 
 function copyHookScripts(sourceRoot: string) {
@@ -30,7 +90,15 @@ function copyHookScripts(sourceRoot: string) {
   const srcIntentDir = join(sourceRoot, "src", "intent");
 
   // Copy hook scripts
-  for (const f of ["session-start.ts", "user-prompt-submit.ts", "pre-tool-use.ts", "post-tool-use.ts", "util.ts"]) {
+  for (const f of [
+    "session-start.ts",
+    "session-end.ts",
+    "user-prompt-submit.ts",
+    "pre-tool-use.ts",
+    "post-tool-use.ts",
+    "stop.ts",
+    "util.ts",
+  ]) {
     copyFileSync(join(srcHooksDir, f), join(HOOKS_DIR, f));
   }
 
@@ -46,6 +114,14 @@ function copyHookScripts(sourceRoot: string) {
   mkdirSync(intentOut, { recursive: true });
   for (const f of readdirSync(srcIntentDir)) {
     copyFileSync(join(srcIntentDir, f), join(intentOut, f));
+  }
+
+  // Copy util files
+  const srcUtilDir = join(sourceRoot, "src", "util");
+  const utilOut = join(SYNC_HOME, "hooks", "..", "util");
+  mkdirSync(utilOut, { recursive: true });
+  for (const f of readdirSync(srcUtilDir)) {
+    copyFileSync(join(srcUtilDir, f), join(utilOut, f));
   }
 
   // Daemon entry that imports the daemon server
@@ -80,16 +156,14 @@ type Settings = {
 
 const SYNC_HOOK_TAG = "sync-managed";
 
-function makeHookEntry(scriptName: string, matcher?: string) {
-  const entry: any = {
-    hooks: [
-      {
-        type: "command",
-        command: `bun ${join(HOOKS_DIR, scriptName)}`,
-        [SYNC_HOOK_TAG]: true,
-      },
-    ],
+function makeHookEntry(scriptName: string, matcher?: string, timeoutSec?: number) {
+  const command: any = {
+    type: "command",
+    command: `bun ${join(HOOKS_DIR, scriptName)}`,
+    [SYNC_HOOK_TAG]: true,
   };
+  if (timeoutSec) command.timeout = timeoutSec;
+  const entry: any = { hooks: [command] };
   if (matcher) entry.matcher = matcher;
   return entry;
 }
@@ -98,20 +172,23 @@ function mergeSettings(existing: Settings): Settings {
   const next: Settings = { ...existing };
   next.hooks = { ...(existing.hooks ?? {}) };
 
-  const map: Array<[string, string, string | undefined]> = [
-    ["SessionStart", "session-start.ts", undefined],
-    ["UserPromptSubmit", "user-prompt-submit.ts", undefined],
-    ["PreToolUse", "pre-tool-use.ts", "Edit|Write|MultiEdit"],
-    ["PostToolUse", "post-tool-use.ts", "Edit|Write|MultiEdit"],
+  // 4th tuple slot: per-hook timeout in seconds. PreToolUse needs a long
+  // timeout because it now blocks waiting for peer conflicts to clear.
+  const map: Array<[string, string, string | undefined, number | undefined]> = [
+    ["SessionStart", "session-start.ts", undefined, undefined],
+    ["SessionEnd", "session-end.ts", undefined, undefined],
+    ["UserPromptSubmit", "user-prompt-submit.ts", undefined, undefined],
+    ["PreToolUse", "pre-tool-use.ts", undefined, 600],
+    ["PostToolUse", "post-tool-use.ts", "Edit|Write|MultiEdit", undefined],
+    ["Stop", "stop.ts", undefined, undefined],
   ];
 
-  for (const [event, script, matcher] of map) {
+  for (const [event, script, matcher, timeoutSec] of map) {
     const existingArr: any[] = next.hooks![event] ?? [];
-    // Drop any prior sync-managed entries
     const filtered = existingArr.filter(
       (e) => !e?.hooks?.some?.((h: any) => h?.[SYNC_HOOK_TAG] === true)
     );
-    filtered.push(makeHookEntry(script, matcher));
+    filtered.push(makeHookEntry(script, matcher, timeoutSec));
     next.hooks![event] = filtered;
   }
   return next;
@@ -130,6 +207,38 @@ function unmergeSettings(existing: Settings): Settings {
     else next.hooks[event] = filtered;
   }
   return next;
+}
+
+const SYNC_GITIGNORE_MARKER = "# Sync (Claude Code coordination layer)";
+const SYNC_GITIGNORE_BLOCK = `\n${SYNC_GITIGNORE_MARKER}\n.claude/settings.json\n.claude/.sync-session-id\n`;
+
+function updateGitignore(cwd: string): { added: boolean; created: boolean } {
+  const p = join(cwd, ".gitignore");
+  if (existsSync(p)) {
+    const current = readFileSync(p, "utf8");
+    if (current.includes(SYNC_GITIGNORE_MARKER)) {
+      return { added: false, created: false };
+    }
+    appendFileSync(p, SYNC_GITIGNORE_BLOCK);
+    return { added: true, created: false };
+  }
+  writeFileSync(p, SYNC_GITIGNORE_BLOCK.trimStart());
+  return { added: true, created: true };
+}
+
+function cleanGitignore(cwd: string): boolean {
+  const p = join(cwd, ".gitignore");
+  if (!existsSync(p)) return false;
+  const current = readFileSync(p, "utf8");
+  const cleaned = current.replace(
+    /\n?# Sync \(Claude Code coordination layer\)\n\.claude\/settings\.json\n\.claude\/\.sync-session-id\n?/,
+    ""
+  );
+  if (cleaned !== current) {
+    writeFileSync(p, cleaned);
+    return true;
+  }
+  return false;
 }
 
 function settingsPath(scope: "project" | "user", projectDir: string): string {
@@ -152,7 +261,7 @@ function writeSettings(p: string, s: Settings) {
 }
 
 const program = new Command();
-program.name("sync").description("Self-coordinating multi-session layer for Claude Code").version("0.1.0");
+program.name("syncc").description("Self-coordinating multi-session layer for Claude Code").version("0.1.0");
 
 program
   .command("init")
@@ -167,10 +276,24 @@ program
     const existing = readSettings(p);
     const merged = mergeSettings(existing);
     writeSettings(p, merged);
+    if (scope === "project") {
+      const r = updateGitignore(opts.project);
+      if (r.created) {
+        console.log("✔ Created .gitignore with Sync entries (your hook config stays local)");
+      } else if (r.added) {
+        console.log("✔ Added Sync entries to .gitignore (private hook config won't be committed)");
+      } else {
+        console.log("ℹ .gitignore already covers Sync entries");
+      }
+    }
+    const slash = installSlashCommands(sourceRoot);
+    if (slash.installed > 0) {
+      console.log(`✔ Installed ${slash.installed} Claude slash commands (/sync-me, /sync-status, /sync-peers)`);
+    }
     await ensureDaemon();
     console.log(`[sync] hooks installed in ${p}`);
     console.log(`[sync] daemon listening on http://127.0.0.1:${SYNC_PORT}`);
-    console.log(`[sync] run \`sync mon\` in a separate terminal to watch the mesh`);
+    console.log(`[sync] run \`syncc mon\` in a separate terminal to watch the mesh`);
   });
 
 program
@@ -189,6 +312,13 @@ program
     const cleaned = unmergeSettings(existing);
     writeSettings(p, cleaned);
     console.log(`[sync] hooks removed from ${p}`);
+    if (scope === "project" && cleanGitignore(opts.project)) {
+      console.log("✔ Removed Sync entries from .gitignore");
+    }
+    const removed = uninstallSlashCommands();
+    if (removed > 0) {
+      console.log(`✔ Removed ${removed} Sync slash commands from ~/.claude/commands/`);
+    }
   });
 
 program
@@ -232,6 +362,87 @@ program
       `lsof -t -iTCP:${SYNC_PORT} -sTCP:LISTEN | xargs kill 2>/dev/null || true`,
     ]);
     console.log("[sync] daemon stopped");
+  });
+
+program
+  .command("lock <file>")
+  .description("Demo helper: hold a lock on <file> for N seconds (default 30) so a peer session gets BLOCKED")
+  .option("-s, --seconds <n>", "How long to hold the lock", "30")
+  .option("-i, --id <id>", "Fake session id to attribute the lock to", "demo-hold")
+  .option("--summary <text>", "Fake intent summary shown in the deny reason", "Holding for demo")
+  .action(async (file: string, opts: { seconds: string; id: string; summary: string }) => {
+    await ensureDaemon();
+    const absPath = resolve(process.cwd(), file);
+    const ttl = Math.max(1, parseInt(opts.seconds, 10)) * 1000;
+    // register a fake session so peer sees a meaningful "held_by_summary"
+    await postJson("/sessions", {
+      id: opts.id,
+      pid: process.pid,
+      cwd: process.cwd(),
+      branch: "demo",
+    });
+    await postJson("/intents", {
+      session_id: opts.id,
+      intent: { summary: opts.summary, will_modify: [absPath], will_create: [], depends_on: [] },
+    });
+    const r = await postJson<any>("/locks/acquire", { session_id: opts.id, path: absPath });
+    if (r.status !== 200) {
+      console.log(`[sync] could not acquire lock (status ${r.status}):`, r.data);
+      process.exit(1);
+    }
+    console.log(`[sync] holding lock on ${absPath} for ${ttl / 1000}s as session "${opts.id}"`);
+    console.log("[sync] start a peer claude session NOW and have it edit this file → BLOCKED event will fire");
+    console.log(`[sync] press Ctrl+C to release early`);
+    const release = async () => {
+      await postJson("/locks/release", { session_id: opts.id, path: absPath });
+      // also unregister the fake session so the demo mesh stays clean
+      await fetch(`${DAEMON_BASE}/sessions/${encodeURIComponent(opts.id)}`, { method: "DELETE" }).catch(() => {});
+      console.log(`\n[sync] lock released, fake session removed`);
+    };
+    process.on("SIGINT", async () => {
+      await release();
+      process.exit(0);
+    });
+    await new Promise((r) => setTimeout(r, ttl));
+    await release();
+  });
+
+program
+  .command("reset")
+  .description("Wipe daemon state (kills daemon + deletes SQLite DB). Settings + .gitignore untouched.")
+  .action(() => {
+    spawnSync("sh", [
+      "-c",
+      `lsof -t -iTCP:${SYNC_PORT} -sTCP:LISTEN | xargs kill 2>/dev/null || true`,
+    ]);
+    const dbPath = join(SYNC_HOME, "sync.db");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const p = dbPath + suffix;
+      if (existsSync(p)) {
+        try {
+          require("node:fs").unlinkSync(p);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    console.log("[sync] daemon stopped & DB wiped. Run `syncc init` (or any syncc command) to restart.");
+  });
+
+program
+  .command("pause")
+  .description("Temporarily disable Sync (sessions still register? no — they skip)")
+  .action(() => {
+    writeSyncState({ enabled: false });
+    console.log("[sync] paused — new claude sessions will skip Sync. Run `syncc resume` to re-enable.");
+  });
+
+program
+  .command("resume")
+  .description("Re-enable Sync after a pause")
+  .action(() => {
+    writeSyncState({ enabled: true });
+    console.log("[sync] resumed — new claude sessions will join the mesh again.");
   });
 
 program

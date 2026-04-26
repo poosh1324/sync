@@ -3,12 +3,17 @@ import { resolve } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import {
   ensureDaemon,
+  getJson,
   getRepoRoot,
   postJson,
-  readSessionId,
   readStdinJson,
   safeExit,
+  setTerminalTitle,
+  shortIdFromInput,
+  logHookError,
+  logHookInfo,
 } from "./util";
+import { basename } from "node:path";
 import { parseIntentFromText, detectExports } from "../intent/parse";
 
 type PostToolInput = {
@@ -50,15 +55,23 @@ async function main() {
     const input = (await readStdinJson<PostToolInput>()) ?? {};
     const cwd = input.cwd ?? process.cwd();
     const repo = getRepoRoot(cwd);
-    const sessionId = readSessionId(repo);
+    const sessionId = shortIdFromInput(input as any);
     const filePath = input.tool_input?.file_path;
+    logHookInfo(
+      "post-tool-use",
+      `session=${sessionId} tool=${input.tool_name} file=${filePath} hasTranscript=${Boolean(input.transcript_path)}`
+    );
     if (!sessionId) safeExit(0);
 
     await ensureDaemon();
 
     if (filePath) {
       const absPath = resolve(repo, filePath);
-      await postJson("/locks/release", { session_id: sessionId, path: absPath });
+      const releaseRes = await postJson("/locks/release", { session_id: sessionId, path: absPath });
+      logHookInfo("post-tool-use", `release ${absPath} → ${releaseRes.status}`);
+      // Mark this file as done in our active intent so any peer waiting
+      // on it can dequeue. Idempotent — calling repeatedly is harmless.
+      await postJson("/intents/remove-file", { session_id: sessionId, file: absPath }).catch(() => {});
 
       if (existsSync(absPath)) {
         try {
@@ -82,13 +95,27 @@ async function main() {
     if (transcript) {
       const intent = parseIntentFromText(transcript);
       if (intent) {
+        // Normalize will_modify to absolute paths — PreToolUse does this on
+        // first registration, but if we re-post raw transcript paths we'd
+        // overwrite the daemon's absolute paths with relative ones, which
+        // breaks conflict detection (peers compare absolute paths) and
+        // remove-file (path mismatch leaves files stuck in will_modify).
+        intent.will_modify = intent.will_modify.map((p) =>
+          p && !p.startsWith("/") ? resolve(repo, p) : p
+        );
         await postJson("/intents", { session_id: sessionId, intent });
       }
     }
 
     await postJson("/heartbeat", { session_id: sessionId });
-  } catch {
-    /* never break the user's claude session */
+    // After completing the tool, mark idle so peers see we're not actively
+    // editing right now (between tool calls). PreToolUse will flip it back.
+    await postJson("/status", { session_id: sessionId, status: "idle" }).catch(() => {});
+    // (We don't touch the terminal title here — Claude Code immediately
+    // overwrites it with its own task description and we lose. Only the Stop
+    // hook restores "sync <label> · idle" once the whole turn is done.)
+  } catch (err) {
+    logHookError("post-tool-use", err);
   }
   safeExit(0);
 }

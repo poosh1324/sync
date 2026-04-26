@@ -1,26 +1,46 @@
 # Sync
 
-> The protocol layer for the way vibe-coders already work.
+> **The kernel layer for AI agent orchestration.**
+> OS coordinated processes. Databases coordinated transactions. Compilers coordinated symbols.
+> The next system layer to build is the one that coordinates **AI agents**. Sync is a first attempt.
 
-Run `claude` in 3 terminals on the same repo. **Sync** silently makes them aware of each other, prevents file-write collisions, and shares newly-created exports — automatically, with **zero workflow change**.
+Run `claude` in 3 terminals on the same repo. **Sync** silently makes them aware of each other, queues conflicting writes, and shares newly-created exports — automatically, with **zero workflow change** and **no extra LLM calls**.
 
 ```
-$ sync init        # one command, in your project
-$ claude           # terminal 1
-$ claude           # terminal 2
-$ claude           # terminal 3
-$ sync mon         # terminal 4 — watch the mesh
+$ syncc init        # one command, in your project
+$ claude            # terminal 1 — labeled [A]
+$ claude            # terminal 2 — labeled [B]
+$ claude            # terminal 3 — labeled [C]
+$ syncc mon         # terminal 4 — watch the mesh live
 ```
 
-## Three pillars
+---
 
-1. **Awareness** — every Claude session sees what every other session is doing (intent, files in flight, completed exports).
-2. **Conflict avoidance** — two sessions never write the same file at the same time. The second one is told politely to pivot.
-3. **Result sharing** — when one session creates a new exported symbol, peers learn about it before their next turn — no spec, no `/commands`, no human in the loop.
+## Why Sync exists
 
-No SaaS. No API key. No MCP server. No agent framework. Just Claude Code's built-in hooks + a tiny local Bun daemon (~127.0.0.1:7777).
+Spin up two AI coding agents on the same repo and you get the same problems we've solved before in OS, DB, and compiler design — but at the agent layer:
 
-## Install
+- They overwrite each other's files.
+- They redo each other's work because neither sees what the other built.
+- They have no shared notion of *intent*, *locks*, or *symbols*.
+
+Existing approaches reach for a **coordinator LLM** — a top-level orchestrator that plans, delegates, and reconciles. That works, but it costs an API key, adds latency, and makes the whole system depend on a SaaS.
+
+**Sync's bet is different:** the agents you're already running are intelligent enough to coordinate themselves — *if* a tiny local layer feeds them the right context and enforces the right boundaries. So Sync injects mesh awareness into Claude's existing turns and intercepts at the tool boundary. The orchestration intelligence is a free side-effect of work the user is already paying for.
+
+No coordinator LLM. No API key. No SaaS. No MCP server. Just Claude Code's built-in hooks + a small local Bun daemon (`127.0.0.1:7777`).
+
+---
+
+## The three pillars
+
+1. **Awareness** — every Claude session sees what every other session is doing: intent, files in flight, completed exports, queue state.
+2. **Conflict avoidance** — two sessions never write the same file at the same time. Sync queues the second one *transparently* (its tool call simply takes a moment longer) until the first finishes.
+3. **Result sharing** — when one session creates a new exported symbol, peers learn about it before their next turn. No spec, no `/commands`, no human in the loop.
+
+---
+
+## Quick start
 
 Requires [Bun](https://bun.sh/) ≥ 1.3 and Claude Code ≥ 2.0.10.
 
@@ -28,58 +48,134 @@ Requires [Bun](https://bun.sh/) ≥ 1.3 and Claude Code ≥ 2.0.10.
 git clone https://github.com/poosh1324/sync
 cd sync
 bun install
-bun run src/cli/index.ts init   # in your project directory
-bun run src/cli/index.ts mon    # in a separate terminal
+bun link                         # registers `syncc` on your PATH
+
+cd <your-project>
+syncc init                       # in your project directory
+syncc mon                        # in a separate terminal — live dashboard
 ```
 
-`sync init` writes hooks into `.claude/settings.json`, copies the daemon and hook scripts to `~/.sync/`, and starts the daemon in the background.
+> The CLI is named **`syncc`** (with two c's) so it never collides with the macOS/BSD `sync(8)` disk-flush command.
+
+`syncc init` does five things, all reversible:
+
+1. Writes Sync's hook entries into `.claude/settings.json`.
+2. Copies the daemon and hook scripts to `~/.sync/` (so they're stable across project moves).
+3. Installs three slash commands (`/sync-me`, `/sync-status`, `/sync-peers`) into `~/.claude/commands/`.
+4. Adds Sync entries to `.gitignore` so your private hook config never gets committed.
+5. Starts the local daemon in the background.
+
+Now open one or more `claude` terminals in that project. Each one shows a banner like:
+
+```
+╭──────────────────────────────────────────────────────╮
+│ You are session [B]   · peers: A                     │
+│ Repo:   ~/code/myapp                                  │
+│ Branch: main                                          │
+│ Mesh:   2 sessions                                    │
+│ View live: `syncc mon` in another pane                │
+╰──────────────────────────────────────────────────────╯
+```
+
+That's it. They'll coordinate themselves from here.
+
+---
 
 ## How it works
 
 ```
 ┌──────────┐    ┌──────────┐    ┌──────────┐
-│ claude 1 │    │ claude 2 │    │ claude 3 │
+│ claude A │    │ claude B │    │ claude C │
 └────┬─────┘    └────┬─────┘    └────┬─────┘
-     │  hooks       │  hooks       │  hooks
-     │ (4 lifecycle)│              │
-     └──────────────┴──────────────┘
-                    │
-            ┌───────▼───────┐
-            │ sync daemon   │  Bun.serve + bun:sqlite
-            │ 127.0.0.1:7777│  state · locks · intents · exports
-            └───────┬───────┘
-                    │ /state every 500ms
-            ┌───────▼───────┐
-            │   sync mon    │  Ink TUI
-            └───────────────┘
+     │  6 hooks      │  6 hooks      │  6 hooks
+     └───────────────┴───────────────┘
+                     │
+             ┌───────▼───────┐
+             │ sync daemon   │  Bun.serve + bun:sqlite
+             │ 127.0.0.1:7777│  sessions · locks · intents · exports
+             └───────┬───────┘
+                     │ /state every 500ms
+             ┌───────▼───────┐
+             │   syncc mon    │  Ink TUI dashboard
+             └───────────────┘
 ```
 
-The four hooks Sync uses (registered automatically into your project's `.claude/settings.json`):
+Sync registers six hooks into your project's `.claude/settings.json`:
 
-| Hook              | What Sync does                                                            |
-| ----------------- | ------------------------------------------------------------------------- |
-| `SessionStart`    | registers the session with the daemon, records cwd + git branch           |
-| `UserPromptSubmit`| injects mesh context into Claude's system prompt; asks Claude to declare its intent in a `<sync-intent>` tag |
-| `PreToolUse`      | for `Edit`/`Write`/`MultiEdit`: checks the file lock; denies politely if held |
-| `PostToolUse`     | releases the lock; scans the saved file for new `export`s; broadcasts them; parses `<sync-intent>` from Claude's reply |
+| Hook                | What it does                                                                                        |
+| ------------------- | --------------------------------------------------------------------------------------------------- |
+| `SessionStart`      | Registers the session, assigns a label (`A`, `B`, `C`, …), prints the welcome banner.               |
+| `UserPromptSubmit`  | Injects mesh state + the `<sync-intent>` planning protocol into Claude's system prompt.             |
+| `PreToolUse`        | Before each Edit/Write/MultiEdit, checks for conflicts. **If a peer holds it, queues — doesn't deny.** |
+| `PostToolUse`       | Releases the file lock; scans for new `export`s; broadcasts them; updates the active intent.        |
+| `Stop`              | Clears intent, prints a turn-summary box of who's still editing / queued in the repo.               |
+| `SessionEnd`        | Cleans up on `/exit` or `/logout`. Survives `/clear`, compaction, and subagent ends.                |
 
-Intent extraction happens *inside the user's existing Claude session* — no extra LLM calls, no API key needed.
+### The `<sync-intent>` protocol
 
-## CLI
+On every prompt, Sync asks Claude to emit a small block at the top of its response:
+
+```xml
+<sync-intent>
+{
+  "summary": "Refactor auth middleware",
+  "will_modify": ["src/auth/middleware.ts", "src/auth/types.ts"],
+  "will_create": ["validateToken"],
+  "depends_on": []
+}
+</sync-intent>
+```
+
+The user never sees it — Sync strips it from view. But peers do. This is how a session declares "here's what I'm about to touch" *without anyone running an extra LLM*.
+
+### Queue, don't deny
+
+When session B's plan overlaps session A's, Sync used to deny B's tool call. Now it **queues** it: B's `Edit` simply takes longer to return, and when A finishes (releases its lock or moves on), B's tool call resumes and runs normally. No retry logic on Claude's side. No human intervention.
+
+After ~9 minutes of waiting, Sync gives up and denies with a clear message — but in normal use, conflicts clear in seconds.
+
+---
+
+## CLI reference
 
 ```
-sync init        # install hooks into the current project
-sync mon         # open the mesh dashboard (Ink TUI)
-sync status      # one-shot text dump of mesh state
-sync stop        # kill the local daemon
-sync uninstall   # cleanly remove Sync hook entries
+syncc init           # install hooks, daemon, slash commands; auto-update .gitignore
+syncc mon            # live mesh dashboard (Ink TUI)
+syncc status         # one-shot text dump of mesh state
+syncc lock <file>    # demo: hold a file lock so a peer session gets queued
+syncc pause          # temporarily disable Sync (new sessions skip registration)
+syncc resume         # re-enable
+syncc stop           # kill the local daemon
+syncc reset          # wipe daemon DB + restart fresh
+syncc uninstall      # cleanly remove hooks, slash commands, .gitignore block
 ```
+
+Inside any `claude` session, three slash commands are also available:
+
+- `/sync-me` — who am I, what's my label, what are peers doing?
+- `/sync-peers` — table of peer sessions on this repo grouped by status
+- `/sync-status` — full mesh snapshot across all repos
+
+---
+
+## Privacy & isolation
+
+- **Per-project** — Sync only activates in directories where you've run `syncc init`. Other repos are untouched.
+- **Local-only** — Hook config lives in `.claude/settings.json` (auto-gitignored). Nothing leaves your machine.
+- **Per-repo mesh** — Sessions are grouped by repo root. Two projects on the same machine never see each other's mesh.
+- **Always visible** — Every `claude` session prints its label and repo. `syncc mon` shows the live mesh. `syncc status` for a snapshot.
+- **Easy off-switch** — `syncc pause` (temporary), `syncc uninstall` (permanent — also cleans up `.gitignore`).
+
+---
 
 ## Why this and not...
 
-- **claude-presence (MCP)**: requires `/register` and `/claim` slash commands run by hand. Sync is automatic and *enforced* via PreToolUse deny.
-- **Claude Code Agent Teams**: top-down lead-coordinator model that needs a task list. Sync is peer-to-peer with no spec.
-- **agent-orchestrator (worktree-per-agent)**: file-level isolation across separate worktrees. Sync runs all sessions on the **same working tree** with symbol-level awareness.
+- **claude-presence (MCP)** — requires manual `/register` and `/claim` slash commands. Sync is automatic and *enforced* at the tool boundary.
+- **Claude Code Agent Teams** — top-down lead-coordinator model that needs a task list. Sync is peer-to-peer with no spec.
+- **agent-orchestrator (worktree-per-agent)** — file-level isolation across separate worktrees. Sync runs all sessions on the **same working tree** with symbol-level awareness.
+- **Coordinator-LLM frameworks (LangGraph, CrewAI, etc.)** — add a planning LLM on top. Sync adds **zero** extra inference; coordination piggybacks on the agents you're already running.
+
+---
 
 ## Built at
 

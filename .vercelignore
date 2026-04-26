@@ -1,0 +1,10 @@
+node_modules
+src
+demo
+*.db
+*.db-wal
+*.db-shm
+.claude
+BUILD_LOG.md
+bun.lock
+tsconfig.json

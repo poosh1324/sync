@@ -1,4 +1,4 @@
-import "./db";
+import { db } from "./db";
 import {
   upsertSession,
   getSession,
@@ -7,7 +7,10 @@ import {
   heartbeat,
   setIntent,
   setStatus,
+  clearIntent,
+  removeFileFromIntent,
   pruneStale,
+  pruneDead,
 } from "./registry";
 import {
   acquireLock,
@@ -21,6 +24,8 @@ import { IntentSchema } from "./types";
 
 const PORT = Number(process.env.SYNC_PORT ?? 7777);
 const HOST = "127.0.0.1";
+const DAEMON_STARTED_AT = Date.now();
+const VERSION = "0.1.0";
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -37,9 +42,17 @@ async function readJson(req: Request): Promise<any> {
   }
 }
 
-const STALE_SESSION_MS = 60_000;
+const STALE_SESSION_MS = 30 * 60_000; // 30 min — claude can think for many minutes between hooks
 
 setInterval(() => {
+  // Drop sessions whose claude process is gone (Ctrl+C / window close — cases
+  // where SessionEnd hook never fired). Runs on the same 5s tick as the lock
+  // pruner so the monitor reflects reality within ~5s of a session dying.
+  const deadSessions = pruneDead();
+  for (const id of deadSessions) {
+    recordEvent({ ts: Date.now(), type: "session_left", session_id: id });
+    releaseAllForSession(id);
+  }
   const removedSessions = pruneStale(STALE_SESSION_MS);
   for (const id of removedSessions) {
     recordEvent({ ts: Date.now(), type: "session_left", session_id: id });
@@ -60,7 +73,8 @@ const server = Bun.serve({
     const method = req.method;
 
     try {
-      if (path === "/health") return json({ ok: true, ts: Date.now() });
+      if (path === "/health")
+        return json({ status: "ok", ok: true, ts: Date.now(), started_at: DAEMON_STARTED_AT, version: VERSION });
 
       if (path === "/sessions" && method === "POST") {
         const body = await readJson(req);
@@ -107,6 +121,81 @@ const server = Bun.serve({
           intent: parsed.data,
         });
         return json({ ok: true });
+      }
+
+      if (path === "/intents/clear" && method === "POST") {
+        const body = await readJson(req);
+        if (!body.session_id) return json({ error: "missing session_id" }, 400);
+        clearIntent(body.session_id);
+        return json({ ok: true });
+      }
+
+      if (path === "/intents/remove-file" && method === "POST") {
+        const body = await readJson(req);
+        if (!body.session_id || !body.file) return json({ error: "missing fields" }, 400);
+        removeFileFromIntent(body.session_id, body.file);
+        return json({ ok: true });
+      }
+
+      // Given a candidate intent, return any conflicting peer sessions.
+      //
+      // Conflict definition:
+      //   - A peer holds a file LOCK on a path I plan to modify, OR
+      //   - A peer has an active INTENT whose will_modify intersects mine,
+      //     AND the peer joined the mesh before me (older started_at wins).
+      //
+      // The "older wins" tiebreaker prevents the deadlock where two sessions
+      // start at almost the same time, each see the other's intent, and both
+      // decide to wait. With the rule, the older session sees no conflict
+      // from the younger one and proceeds; the younger one yields.
+      //
+      // Locks are independent of this rule — first-come-first-served on
+      // file locks (a younger session already holding a lock still wins).
+      if (path === "/intents/conflict" && method === "POST") {
+        const body = await readJson(req);
+        if (!body.session_id || !body.intent || !body.cwd) return json({ error: "missing fields" }, 400);
+        const myParsed = IntentSchema.safeParse(body.intent);
+        if (!myParsed.success) return json({ error: "invalid intent" }, 400);
+        const myFiles = new Set(myParsed.data.will_modify.map(String));
+        const me = getSession(body.session_id);
+        const myStartedAt = me?.started_at ?? Number.MAX_SAFE_INTEGER;
+        const peers = listSessions().filter((s) => s.id !== body.session_id && s.cwd === body.cwd);
+        const peerLocks = listLocks();
+        const conflicts: Array<{
+          peer_id: string;
+          peer_summary: string;
+          via: "intent" | "lock";
+          file: string;
+        }> = [];
+        for (const peer of peers) {
+          const peerIntent = peer.current_intent;
+          // Intent-vs-intent: only yield to peers that joined BEFORE me
+          if (peerIntent && peerIntent.will_modify && peer.started_at < myStartedAt) {
+            for (const f of peerIntent.will_modify.map(String)) {
+              if (myFiles.has(f)) {
+                conflicts.push({
+                  peer_id: peer.id,
+                  peer_summary: peerIntent.summary || "(no summary)",
+                  via: "intent",
+                  file: f,
+                });
+              }
+            }
+          }
+          // Lock conflict: independent of join order
+          const peerOwnedLocks = peerLocks.filter((l) => l.session_id === peer.id);
+          for (const l of peerOwnedLocks) {
+            if (myFiles.has(l.path)) {
+              conflicts.push({
+                peer_id: peer.id,
+                peer_summary: peer.current_intent?.summary || "(no summary)",
+                via: "lock",
+                file: l.path,
+              });
+            }
+          }
+        }
+        return json({ conflicts });
       }
 
       if (path === "/status" && method === "POST") {
@@ -176,24 +265,77 @@ const server = Bun.serve({
           });
           return json({ ok: true });
         }
+        if (body.type === "session_queued") {
+          if (!body.session_id || !body.held_by || !body.reason) return json({ error: "missing fields" }, 400);
+          recordEvent({
+            ts: Date.now(),
+            type: "session_queued",
+            session_id: body.session_id,
+            held_by: body.held_by,
+            reason: body.reason,
+          });
+          return json({ ok: true });
+        }
+        if (body.type === "session_resumed") {
+          if (!body.session_id) return json({ error: "missing session_id" }, 400);
+          recordEvent({
+            ts: Date.now(),
+            type: "session_resumed",
+            session_id: body.session_id,
+            waited_ms: Number(body.waited_ms ?? 0),
+          });
+          return json({ ok: true });
+        }
         return json({ error: "unsupported broadcast type" }, 400);
+      }
+
+      // Demo iteration helper — wipe all mesh state without restarting the
+       // daemon. Used by sync-web-demo/repeat-demo.sh between takes so the
+       // dashboard, dev server, and live claude panes can stay up across
+       // iterations. NOT exposed publicly: 127.0.0.1 only, no auth.
+      if (path === "/admin/wipe" && method === "POST") {
+        db.exec("DELETE FROM sessions");
+        db.exec("DELETE FROM locks");
+        db.exec("DELETE FROM exports");
+        db.exec("DELETE FROM events");
+        return json({ ok: true });
       }
 
       if (path === "/state" && method === "GET") {
         const excluding = url.searchParams.get("excluding") ?? undefined;
+        const cwdFilter = url.searchParams.get("cwd") ?? undefined;
+        let sessions = listSessions(excluding ? { excluding } : {});
+        if (cwdFilter) sessions = sessions.filter((s) => s.cwd === cwdFilter);
+        const sessionIds = new Set(sessions.map((s) => s.id));
+        let locks = listLocks();
+        let exps = recentExports(20, excluding ? { excluding } : {});
+        if (cwdFilter) {
+          locks = locks.filter((l) => sessionIds.has(l.session_id));
+          exps = exps.filter((e) => sessionIds.has(e.session_id));
+        }
         return json({
-          sessions: listSessions(excluding ? { excluding } : {}),
-          locks: listLocks(),
-          recent_exports: recentExports(20, excluding ? { excluding } : {}),
+          sessions,
+          locks,
+          recent_exports: exps,
           events: recentEvents(40),
         });
       }
 
       if (path === "/state/full" && method === "GET") {
+        const cwdFilter = url.searchParams.get("cwd") ?? undefined;
+        let sessions = listSessions();
+        if (cwdFilter) sessions = sessions.filter((s) => s.cwd === cwdFilter);
+        const sessionIds = new Set(sessions.map((s) => s.id));
+        let locks = listLocks();
+        let exps = recentExports(20);
+        if (cwdFilter) {
+          locks = locks.filter((l) => sessionIds.has(l.session_id));
+          exps = exps.filter((e) => sessionIds.has(e.session_id));
+        }
         return json({
-          sessions: listSessions(),
-          locks: listLocks(),
-          recent_exports: recentExports(20),
+          sessions,
+          locks,
+          recent_exports: exps,
           events: recentEvents(40),
         });
       }

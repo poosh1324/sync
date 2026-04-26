@@ -364,8 +364,8 @@
       </div>
       <div class="install">
         <pre class="mono"><span class="prompt">$ </span><span class="cmd">git clone https://github.com/poosh1324/sync &amp;&amp; cd sync</span>
-<span class="prompt">$ </span><span class="cmd">bun install</span>
-<span class="prompt">$ </span><span class="cmd">bun run src/cli/index.ts init</span>   <span class="comment"># in your project</span>
+<span class="prompt">$ </span><span class="cmd">bun install &amp;&amp; bun link</span>   <span class="comment"># registers `syncc` on your PATH</span>
+<span class="prompt">$ </span><span class="cmd">cd ~/your-project &amp;&amp; syncc init</span>
 <span class="prompt">$ </span><span class="cmd">claude</span>     <span class="comment"># terminal 1 — just like always</span>
 <span class="prompt">$ </span><span class="cmd">claude</span>     <span class="comment"># terminal 2 — sync handles the rest</span></pre>
       </div>
@@ -489,7 +489,7 @@
             └───────┬───────┘
                     │ /state every 500ms
             ┌───────▼───────┐
-            │   <span class="yellow">sync mon</span>    │  Ink TUI dashboard
+            │   <span class="yellow">syncc mon</span>   │  Ink TUI dashboard
             └───────────────┘
 </div>
       </div>

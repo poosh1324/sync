@@ -21,7 +21,8 @@ const SCHEMA = [
     started_at INTEGER NOT NULL,
     last_heartbeat INTEGER NOT NULL,
     current_intent TEXT,
-    status TEXT NOT NULL DEFAULT 'idle'
+    status TEXT NOT NULL DEFAULT 'idle',
+    label TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS locks (
     path TEXT PRIMARY KEY,
@@ -45,3 +46,9 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_exports_created_at ON exports(created_at)`,
 ];
 for (const stmt of SCHEMA) db.exec(stmt);
+// Migration: add label column to existing tables created before label was a feature.
+try {
+  db.exec("ALTER TABLE sessions ADD COLUMN label TEXT");
+} catch {
+  /* column already exists */
+}

@@ -4,10 +4,10 @@
   "type": "module",
   "private": true,
   "bin": {
-    "sync": "./dist/cli.js"
+    "syncc": "./dist/index.js"
   },
   "scripts": {
-    "build": "bun build ./src/cli/index.ts --target=bun --outdir=./dist --outfile=cli.js",
+    "build": "bun build ./src/cli/index.ts --target=bun --outdir=./dist",
     "daemon": "bun run src/daemon/server.ts",
     "mon": "bun run src/tui/monitor.tsx",
     "cli": "bun run src/cli/index.ts"

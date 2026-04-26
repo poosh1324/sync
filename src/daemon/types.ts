@@ -19,6 +19,7 @@ export type Session = {
   last_heartbeat: number;
   current_intent: Intent | null;
   status: SessionStatus;
+  label: string | null;
 };
 
 export type Lock = {
@@ -42,7 +43,9 @@ export type Event =
   | { ts: number; type: "lock_acquired"; lock: Lock }
   | { ts: number; type: "lock_released"; path: string; session_id: string }
   | { ts: number; type: "lock_denied"; path: string; held_by: string; requester: string }
-  | { ts: number; type: "export_created"; session_id: string; file: string; symbols: string[] };
+  | { ts: number; type: "export_created"; session_id: string; file: string; symbols: string[] }
+  | { ts: number; type: "session_queued"; session_id: string; reason: string; held_by: string }
+  | { ts: number; type: "session_resumed"; session_id: string; waited_ms: number };
 
 export type StateSnapshot = {
   sessions: Session[];
