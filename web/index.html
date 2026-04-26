@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Sync — multi-session protocol layer for Claude Code</title>
+    <meta
+      name="description"
+      content="Run claude in N terminals on the same repo. Sync silently coordinates them — awareness, conflict avoidance, result sharing. Zero workflow change."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #0a0a0c;
+        --bg-2: #111114;
+        --fg: #f0f0f0;
+        --muted: #8a8a93;
+        --accent: #7cf28b;
+        --accent-2: #5af7d8;
+        --warn: #ffd166;
+        --danger: #ff6b6b;
+        --border: #232328;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: "Inter", system-ui, sans-serif;
+        line-height: 1.55;
+      }
+      .mono {
+        font-family: "JetBrains Mono", ui-monospace, monospace;
+      }
+      .container {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 32px 24px;
+      }
+      header.nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 18px 24px;
+        border-bottom: 1px solid var(--border);
+        position: sticky;
+        top: 0;
+        background: rgba(10, 10, 12, 0.85);
+        backdrop-filter: blur(8px);
+        z-index: 50;
+      }
+      header.nav .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 700;
+      }
+      header.nav .brand-dot {
+        width: 10px;
+        height: 10px;
+        background: var(--accent);
+        border-radius: 50%;
+        box-shadow: 0 0 12px var(--accent);
+      }
+      header.nav .links a {
+        color: var(--muted);
+        text-decoration: none;
+        margin-left: 24px;
+        font-size: 14px;
+      }
+      header.nav .links a:hover {
+        color: var(--fg);
+      }
+      .hero {
+        padding: 96px 24px 56px;
+        text-align: center;
+        background: radial-gradient(
+            ellipse at top,
+            rgba(124, 242, 139, 0.07),
+            transparent 60%
+          ),
+          var(--bg);
+      }
+      .hero h1 {
+        font-size: clamp(40px, 7vw, 84px);
+        margin: 0 0 18px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        line-height: 1.05;
+      }
+      .hero h1 .grad {
+        background: linear-gradient(120deg, var(--accent), var(--accent-2));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .hero .tag {
+        font-size: clamp(16px, 2.2vw, 22px);
+        color: var(--muted);
+        max-width: 720px;
+        margin: 0 auto 32px;
+      }
+      .cta {
+        display: inline-flex;
+        gap: 14px;
+        align-items: center;
+        flex-wrap: wrap;
+        justify-content: center;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 12px 22px;
+        border-radius: 10px;
+        text-decoration: none;
+        font-weight: 600;
+        font-size: 15px;
+        transition: transform 0.15s ease, background 0.15s ease;
+        border: 1px solid var(--border);
+      }
+      .btn-primary {
+        background: var(--accent);
+        color: #0b1e10;
+        border-color: var(--accent);
+      }
+      .btn-primary:hover {
+        transform: translateY(-1px);
+      }
+      .btn-secondary {
+        background: transparent;
+        color: var(--fg);
+      }
+      .btn-secondary:hover {
+        background: var(--bg-2);
+      }
+      .install {
+        margin-top: 36px;
+        display: flex;
+        justify-content: center;
+      }
+      .install pre {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px 24px;
+        text-align: left;
+        font-size: 14px;
+        overflow-x: auto;
+        max-width: 100%;
+      }
+      .install pre .prompt {
+        color: var(--muted);
+      }
+      .install pre .cmd {
+        color: var(--accent);
+      }
+      .install pre .comment {
+        color: var(--muted);
+      }
+
+      section {
+        padding: 80px 24px;
+        border-top: 1px solid var(--border);
+      }
+      section h2 {
+        font-size: clamp(28px, 4vw, 40px);
+        font-weight: 700;
+        letter-spacing: -0.01em;
+        margin: 0 0 12px;
+      }
+      section .sub {
+        color: var(--muted);
+        max-width: 640px;
+        margin-bottom: 36px;
+      }
+
+      .pillars {
+        display: grid;
+        gap: 18px;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      }
+      .pillar {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 26px;
+        transition: border-color 0.15s ease, transform 0.15s ease;
+      }
+      .pillar:hover {
+        border-color: var(--accent);
+        transform: translateY(-2px);
+      }
+      .pillar .num {
+        font-size: 12px;
+        color: var(--muted);
+        letter-spacing: 0.1em;
+      }
+      .pillar h3 {
+        margin: 8px 0 10px;
+        font-size: 22px;
+      }
+      .pillar p {
+        color: var(--muted);
+        margin: 0;
+        font-size: 15px;
+      }
+
+      .demo-block {
+        display: grid;
+        gap: 24px;
+        grid-template-columns: 1fr;
+      }
+      @media (min-width: 880px) {
+        .demo-block {
+          grid-template-columns: 1.05fr 1fr;
+          align-items: start;
+        }
+      }
+      .term {
+        background: #0d0d10;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        overflow: hidden;
+        font-family: "JetBrains Mono", monospace;
+        font-size: 13px;
+      }
+      .term .bar {
+        display: flex;
+        gap: 6px;
+        padding: 10px 14px;
+        background: #131318;
+        border-bottom: 1px solid var(--border);
+      }
+      .term .bar span {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #555;
+      }
+      .term .bar span:nth-child(1) {
+        background: #ff6058;
+      }
+      .term .bar span:nth-child(2) {
+        background: #ffbe2f;
+      }
+      .term .bar span:nth-child(3) {
+        background: #2bca44;
+      }
+      .term .body {
+        padding: 16px 18px;
+        white-space: pre;
+        overflow-x: auto;
+        line-height: 1.5;
+      }
+      .term .body .green {
+        color: var(--accent);
+      }
+      .term .body .yellow {
+        color: var(--warn);
+      }
+      .term .body .red {
+        color: var(--danger);
+      }
+      .term .body .cyan {
+        color: var(--accent-2);
+      }
+      .term .body .dim {
+        color: var(--muted);
+      }
+
+      .compare {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: 1fr;
+      }
+      @media (min-width: 720px) {
+        .compare {
+          grid-template-columns: 1fr 1fr 1fr;
+        }
+      }
+      .compare .card {
+        background: var(--bg-2);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 22px;
+      }
+      .compare .card h4 {
+        margin: 0 0 10px;
+        font-size: 16px;
+      }
+      .compare .card p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .compare .card.ours {
+        border-color: var(--accent);
+        background: linear-gradient(
+          180deg,
+          rgba(124, 242, 139, 0.08),
+          var(--bg-2)
+        );
+      }
+
+      footer {
+        padding: 60px 24px 40px;
+        border-top: 1px solid var(--border);
+        text-align: center;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      footer a {
+        color: var(--fg);
+        text-decoration: none;
+        border-bottom: 1px solid var(--border);
+      }
+    </style>
+  </head>
+  <body>
+    <header class="nav">
+      <div class="brand">
+        <span class="brand-dot"></span>
+        <span class="mono">sync</span>
+      </div>
+      <div class="links">
+        <a href="#how">How it works</a>
+        <a href="#demo">Demo</a>
+        <a href="#why">Why</a>
+        <a
+          href="https://github.com/poosh1324/sync"
+          target="_blank"
+          rel="noreferrer"
+          >GitHub →</a
+        >
+      </div>
+    </header>
+
+    <section class="hero">
+      <h1>
+        N terminals.<br />
+        One <span class="grad">coherent mesh.</span>
+      </h1>
+      <p class="tag">
+        Run <span class="mono">claude</span> in 3 terminals on the same repo.
+        Sync silently makes them aware of each other, prevents file-write
+        collisions, and shares newly-created exports.
+        <strong>Zero workflow change.</strong>
+      </p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/poosh1324/sync"
+          >View on GitHub</a
+        >
+        <a class="btn btn-secondary" href="#how">How it works</a>
+      </div>
+      <div class="install">
+        <pre class="mono"><span class="prompt">$ </span><span class="cmd">git clone https://github.com/poosh1324/sync &amp;&amp; cd sync</span>
+<span class="prompt">$ </span><span class="cmd">bun install</span>
+<span class="prompt">$ </span><span class="cmd">bun run src/cli/index.ts init</span>   <span class="comment"># in your project</span>
+<span class="prompt">$ </span><span class="cmd">claude</span>     <span class="comment"># terminal 1 — just like always</span>
+<span class="prompt">$ </span><span class="cmd">claude</span>     <span class="comment"># terminal 2 — sync handles the rest</span></pre>
+      </div>
+    </section>
+
+    <section class="container" id="why">
+      <h2>Three pillars</h2>
+      <p class="sub">
+        No debate. No voting. No coordinator. Just three things, in every
+        session, automatically.
+      </p>
+      <div class="pillars">
+        <div class="pillar">
+          <div class="num mono">01 — AWARENESS</div>
+          <h3>Every session sees every other session</h3>
+          <p>
+            What they're working on, what files they're touching, what symbols
+            they're about to export. Injected into Claude's context on every
+            prompt.
+          </p>
+        </div>
+        <div class="pillar">
+          <div class="num mono">02 — CONFLICT AVOIDANCE</div>
+          <h3>Two sessions never write the same file</h3>
+          <p>
+            File-level locks via the
+            <span class="mono">PreToolUse</span> hook. The second session is
+            told politely to pivot — and it does, because Claude reads the
+            reason.
+          </p>
+        </div>
+        <div class="pillar">
+          <div class="num mono">03 — RESULT SHARING</div>
+          <h3>New exports propagate before the next turn</h3>
+          <p>
+            When session A ships <span class="mono">createComment()</span>,
+            sessions B and C learn about it on their very next prompt — and use
+            it instead of duplicating.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="container" id="demo">
+      <h2>The demo</h2>
+      <p class="sub">
+        Three terminals, same repo, no spec. Sync mesh on the right shows what's
+        happening live.
+      </p>
+      <div class="demo-block">
+        <div class="term">
+          <div class="bar"><span></span><span></span><span></span></div>
+          <div class="body"><span class="dim">$ </span><span class="green">claude</span>
+<span class="dim">&gt; implement a comment feature</span>
+
+<span class="cyan">[a3f]</span> Editing <span class="mono">src/models/comment.ts</span>
+<span class="cyan">[a3f]</span> Acquired lock on src/models/comment.ts
+<span class="cyan">[a3f]</span> Exported <span class="green">Comment</span>, <span class="green">createComment</span>
+        ─────────────────────────────────────
+<span class="dim">$ </span><span class="green">claude</span>
+<span class="dim">&gt; implement a like feature</span>
+
+<span class="yellow">[b8e]</span> sync injected: peer a3f exports <span class="green">Comment</span>
+<span class="yellow">[b8e]</span> reusing <span class="green">Comment</span> instead of redeclaring
+<span class="yellow">[b8e]</span> Editing <span class="mono">src/models/like.ts</span>
+        ─────────────────────────────────────
+<span class="dim">$ </span><span class="green">claude</span>
+<span class="dim">&gt; add comment editing UI</span>
+
+<span class="red">[c2d] ✗</span> sync DENIED: src/models/comment.ts held by a3f
+<span class="cyan">[c2d]</span> pivoting to src/components/CommentEditor.tsx instead
+</div>
+        </div>
+        <div class="term">
+          <div class="bar"><span></span><span></span><span></span></div>
+          <div class="body">╔════ <span class="cyan">Sync Mesh</span> ════════════════╗
+║ 3 sessions · branch: main      ║
+╚════════════════════════════════╝
+
+╭─ <span class="green">[a3f]</span> Comment feature  ✏️ ─╮
+│ Will create: <span class="green">Comment</span>          │
+│ Holding: comment.ts            │
+╰────────────────────────────────╯
+╭─ <span class="yellow">[b8e]</span> Like feature     ⏳ ─╮
+│ Depends on: <span class="green">Comment</span>           │
+╰────────────────────────────────╯
+╭─ <span class="yellow">[c2d]</span> Comment edit UI  ⏳ ─╮
+│ Depends on: <span class="green">createComment</span>     │
+╰────────────────────────────────╯
+
+<span class="dim">Event log</span>
+13:42:01 a3f announced intent
+13:42:03 b8e announced intent
+13:42:05 a3f acquired comment.ts
+13:42:11 a3f exported <span class="green">Comment</span>
+13:42:11 → injected to b8e, c2d
+<span class="red">13:42:14 c2d BLOCKED on comment.ts</span>
+</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="container" id="how">
+      <h2>How it works</h2>
+      <p class="sub">
+        Pure Claude Code hooks (4 of them) + a tiny local Bun daemon. No SaaS,
+        no API key, no MCP server, no agent framework.
+      </p>
+      <div class="term">
+        <div class="bar"><span></span><span></span><span></span></div>
+        <div class="body">┌──────────┐    ┌──────────┐    ┌──────────┐
+│ <span class="cyan">claude 1</span> │    │ <span class="cyan">claude 2</span> │    │ <span class="cyan">claude 3</span> │
+└────┬─────┘    └────┬─────┘    └────┬─────┘
+     │  hooks       │  hooks       │  hooks
+     │  (4 lifecycle events)        │
+     └──────────────┴──────────────┘
+                    │
+            ┌───────▼───────┐
+            │ <span class="green">sync daemon</span>   │  Bun.serve + bun:sqlite
+            │ <span class="dim">127.0.0.1:7777</span>│  state · locks · intents · exports
+            └───────┬───────┘
+                    │ /state every 500ms
+            ┌───────▼───────┐
+            │   <span class="yellow">sync mon</span>    │  Ink TUI dashboard
+            └───────────────┘
+</div>
+      </div>
+    </section>
+
+    <section class="container">
+      <h2>Why this and not…</h2>
+      <p class="sub">
+        Three other tools live in this space. None of them solve the same
+        problem.
+      </p>
+      <div class="compare">
+        <div class="card">
+          <h4>claude-presence (MCP)</h4>
+          <p>
+            Manual <span class="mono">/register</span> +
+            <span class="mono">/claim</span> commands. Advisory only — Claude
+            can ignore it. Sync is automatic and enforced via PreToolUse deny.
+          </p>
+        </div>
+        <div class="card">
+          <h4>Claude Code Agent Teams</h4>
+          <p>
+            Top-down lead-coordinator. Requires you to write the task list and
+            assign roles. Sync is peer-to-peer with no spec at all.
+          </p>
+        </div>
+        <div class="card ours">
+          <h4>Sync — the way you already work</h4>
+          <p>
+            You open N terminals. You type tasks. Sync makes them coherent. No
+            spec, no commands, no overhead. Same working tree, symbol-level
+            awareness.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      <p>
+        Built in 8 hours at CMUX × AIM Hackathon, Developer Tooling track —
+        April 26, 2026 · Seoul.
+      </p>
+      <p>
+        <a href="https://github.com/poosh1324/sync">github.com/poosh1324/sync</a>
+        · MIT
+      </p>
+    </footer>
+  </body>
+</html>

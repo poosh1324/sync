@@ -1,0 +1,29 @@
+{
+  "name": "sync",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "sync": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "bun build ./src/cli/index.ts --target=bun --outdir=./dist --outfile=cli.js",
+    "daemon": "bun run src/daemon/server.ts",
+    "mon": "bun run src/tui/monitor.tsx",
+    "cli": "bun run src/cli/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/react": "^19.2.14"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "ink": "^7.0.1",
+    "ink-spinner": "^5.0.0",
+    "react": "^19.2.5",
+    "zod": "^4.3.6"
+  }
+}
